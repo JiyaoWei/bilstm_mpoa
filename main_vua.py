@@ -1,19 +1,27 @@
-import os
-from util import get_num_lines, get_vocab, embed_sequence, get_word2idx_idx2word, get_embedding_matrix, get_data, saveSenResult, get_betch
-from util import evaluate,get_w2v_attention
-from model import RNNSequenceClassifier
-from elmoformanylangs import Embedder
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.autograd import Variable
 
-import csv
+import os
+import json
+import time
 import h5py
-import jieba
+import random
 import argparse
-import sys
+from sklearn import metrics
+
+from util import Vocab
+from util import mkdir
+from util import set_seed
+from util import read_dataset
+from util import saveSenResult
+from util import read_cataloge
+from util import batch_loader
+from util import get_time_dif
+from util import get_query_matrix
+from util import get_embedding_matrix
+
+from model import RNNSequenceClassifier
 
 print("PyTorch version:")
 print(torch.__version__)
@@ -21,173 +29,255 @@ print("GPU Detected:")
 print(torch.cuda.is_available())
 using_GPU = True
 
-"""
-1. Data pre-processing
-"""
-'''Q
-1.1 VUA
-get raw dataset as a list:
-  Each element is a triple:
-    a sentence: string
-    a index: int: idx of the focus verb
-    a label: int 1 or 0
-'''
-parser = argparse.ArgumentParser()
-parser.add_argument("--w2v_type_sign")
-parser.add_argument("--save_path_sign")
-args = parser.parse_args()
-print('w2v_attention_type:  ',sys.argv[2],'\tsave_path:  ',sys.argv[4])
+# Training phase.
+def main():
+    parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 
-data_path = 'F:\\LiaoSF\\second_data_experiment\\分类数据\\'        #读取数据地址
-save_path = 'result_all\\'+sys.argv[2]+'_'+sys.argv[4]+'\\'              #保存模型地址
-embedding_sign = 'tence'           #None：不用词向量；  'tence'：使用tence给出的词向量；  'hit'：使用哈工大预训练的elmo；  'allennlp'：使用allenlp给出的elmo
-weight_sign = None                  #True：使用倒数权重；  None：不适用权重
-num_layers=1                        #网络层数
-num_classes = 3                     #类别数
-bidir=True                          #单双向
-hidden_size = 200                   #隐藏层神经元数
-lr=0.01                             #学习率
-momentum=0.9                        #动量
-num_epochs = 60                     #训练轮次
-batch_size = 64                     #批次大小
-dropout1=0.3                        #dropout on input to RNN
-dropout2=0.2                        #dropout in RNN; would be used if num_layers=1
-dropout3=0.2                        #dropout on hidden state of RNN to linear layer
-require_improvement = 1000          #多轮未提高提前退出训练
-print_per_batch = 200               #每多少轮输出一次结果
-embedding_input_type = True              #input词向量训练不训练
-embedding_attention_type = True              #attention词向量训练不训练
-dim = {None:200, 'tence':200, 'hit':1224, 'allennlp':1224}            #embedding维度
-id = {'COAE2015':0, 'EmotionClassficationTest':1, 'ExpressionTest':2, 'NLPCC17':3, 'NLPCC2014':4, '奥运会':5, '春晚':6, '乐视':7, '旅游':8, '微博':9, '雾':10, '端午节':11, '国考':12, '南海':13, '贝克汉姆':14, '闯红灯':15, 'guan':16, 'san':17, '奥巴马':18, '百度':19, '两会':20, 'hui':21, '围棋':22, '比特':23, '韩国':24, '共享':25, 'pin':26, 'han':27, '特朗普':28, 'jiu':29, 'xue':30, '埃':31, '火车票':32, 'shi':33, 'peng':34, 'ipad':35, 'liu':36, 'ming':37, 'fei':38}
-#倒数权重
-W1 = [100.8695652173913, 13.711583924349881, 2.0647917408330367, 30.606860158311346, 17.873651771956858, 43.28358208955224, 3.389830508474576, 46.963562753036435, 207.14285714285714]
-W = W1                              #使用权重
+    # Path options.
+    parser.add_argument("--pretrained_w2v_model_path", required=True, type=str,
+                        help="Path of the tence w2v pretrained model.")
+    parser.add_argument("--query_matrix_path", required=True, type=str,
+                        help="Path of the query matrix.")
+    parser.add_argument("--summary_result_path", required=True, type=str,
+                        help="Path of the output model.")
+    parser.add_argument("--output_result_path", required=True, type=str,
+                        help="Path of the output result.")
+    parser.add_argument("--train_path", type=str, required=True,
+                        help="Path of the trainset.")
+    parser.add_argument("--dev_path", type=str, required=True,
+                        help="Path of the devset.")
+    parser.add_argument("--test_path", type=str, required=True,
+                        help="Path of the testset.")
+    parser.add_argument("--vocab_path", type=str, required=True,
+                        help="Path of the vocab.")
+    parser.add_argument("--elmo_path", type=str, required=True,
+                        help="Path of the elmo features.")
 
-raw_train_vua = get_data(data_path+'train.csv', id)
-raw_test_vua = get_data(data_path+'test.csv', id)
-raw_val_vua = get_data(data_path+'val.csv', id)
-writer_process = open(save_path + 'process.txt', mode='w')
-print('VUA dataset division: ', len(raw_train_vua), len(raw_val_vua), len(raw_test_vua))
-"""
-2. Data preparation
-"""
-'''
-2. 1
-get vocabulary and glove embeddings in raw dataset 
-'''
-# vocab is a set of words
-vocab = get_vocab(raw_train_vua + raw_val_vua + raw_test_vua)
-# two dictionaries. <PAD>: 0, <UNK>: 1
-word2idx, idx2word = get_word2idx_idx2word(vocab)
-# glove_embeddings a nn.Embeddings
-glove_embeddings = get_embedding_matrix(word2idx, idx2word, embedding_sign,embedding_input_type, normalization=False)
-#词向量注意力
-w2v = get_w2v_attention(data_path, sys.argv[2])
-# elmo_embeddings
-elmos_allennlp = h5py.File(data_path+'data.hdf5', 'r')
-elmos_hit = Embedder('C:\\Users\\TitanXp-4\\Downloads\\179')
-"""
-3. Model training
-"""
-'''
-3. 1 
-set up model, loss criterion, optimizer
-'''
-# Instantiate the model
-# embedding_dim = glove + elmo
-rnn_clf = RNNSequenceClassifier(num_classes=num_classes, embedding_dim=dim[embedding_sign],w2v = w2v,embedding_attention_type = embedding_attention_type, hidden_size=hidden_size, num_layers=num_layers, bidir=bidir,dropout1=dropout1, dropout2=dropout2, dropout3=dropout3)
-# Move the model to the GPU if available
-if using_GPU:
-    rnn_clf = rnn_clf.cuda()
-# Set up criterion for calculating loss
-if weight_sign == None:
-    nll_criterion = nn.NLLLoss()
-elif weight_sign == True:
-    nll_criterion = nn.NLLLoss(weight = torch.cuda.FloatTensor([i for i in W]))
-# Set up an optimizer for updating the parameters of the rnn_clf
-attention_p, net_p = [], []
-for name, p in rnn_clf.named_parameters():
-    print(name,'\t',p.shape)
-    if 'attention' in name:
-        attention_p += [p]
+    # Model options.
+    parser.add_argument("--language_type", type=str, choices=["en", "zh"], required=True,
+                        help="Num of the classes.")
+    parser.add_argument("--num_classes", type=int, default=3,
+                        help="Num of the classes.")
+    parser.add_argument("--batch_size", type=int, default=64,
+                        help="Batch size.")
+    parser.add_argument("--require_improvement", type=int, default=5,
+                        help="Require improvement.")
+    parser.add_argument("--epochs_num", type=int, default=100,
+                        help="Number of epochs.")
+    parser.add_argument("--w2v_embedding_dim", type=int, required=True,
+                        help="w2v embedding dim.")
+    parser.add_argument("--elmo_embedding_dim", type=int, default=1024,
+                        help="elmo embedding dim.")
+    parser.add_argument("--input_dim", type=int, required=True,
+                        help="input embedding dim.")
+    parser.add_argument("--seq_length", type=int, default=128,
+                        help="Sequence length.")
+    parser.add_argument("--hidden_size", type=int, default=200,
+                        help="hidden size.")
+    parser.add_argument("--layers_num", type=int, default=2,
+                        help="Number of layers.")
+    parser.add_argument("--attention_query_size", type=int, default=200,
+                        help="Size of attention query matrix.")
+    parser.add_argument("--attention_layer", choices=["att", "m_a", "m_pre_orl_a", "m_pre_orl_pun_a", "m_pol_untrain_a", "mpa", "mpoa"], required=True,
+                        help="attention type.")
+    parser.add_argument("--pretrain_model_type",
+                        choices=["w2v", "elmo", "none"],
+                        required=True,
+                        help="pretrain model type.")
+
+    # Optimizer options.
+    parser.add_argument("--learning_rate", type=float, default=0.1,
+                        help="Learning rate.")
+    parser.add_argument("--momentum", type=float, default=0.9,
+                        help="momentum.")
+    # Training options.
+    parser.add_argument("--dropout", type=float, default=0.2,
+                        help="Dropout.")
+    parser.add_argument("--is_bidir", type=int, default=2,
+                        help="bidir or only one.")
+    parser.add_argument("--report_steps", type=int, default=100,
+                        help="Specific steps to print prompt.")
+    parser.add_argument("--seed", type=int, default=7,
+                        help="Random seed.")
+    parser.add_argument("--run_type", type=str, required=True,
+                        help="usage: python main_vua.py [train / test]")
+
+    args = parser.parse_args()
+
+    #set numpy、random、etc seeds
+    set_seed(args.seed)
+
+    #set vocab
+    vocab = Vocab()
+    vocab.load(args.vocab_path)
+    label_columns = read_cataloge(args.dev_path)
+    #set embedding
+    embeddings = get_embedding_matrix(args, vocab, normalization=False)
+    elmo_embedding = h5py.File(args.elmo_path, 'r')
+    query_matrix = get_query_matrix(args)
+
+    # For simplicity, we use DataParallel wrapper to use multiple GPUs.
+    model = RNNSequenceClassifier(args, embeddings, query_matrix)
+    model = model.cuda()
+
+    best_josn = {'F_macro': 0, 'P_macro': 0, 'R_macro': 0, 'Best_F_macro': 0, 'ACC': 0, 'F_negative': 0,
+                 'F_positive': 0, 'Predict': [], 'Label': [], 'Weights': [], 'Last_up_epoch': 0, 'Total_batch_loss': 0,
+                 'F_nuetral': 0, 'Time':0, 'Total_orthogonal_loss': 0, 'train_num': 0, 'test_num': 0, 'dev_num':0}
+
+    def evaluate(args, is_test):
+        model.eval()
+        if is_test:
+            print("Start testing.")
+            dataset = read_dataset(args, args.test_path, label_columns, vocab)
+            best_josn['test_num'] = len(dataset)
+            writer_result = open(os.path.join(args.output_result_path, 'result.txt'), encoding='utf-8', mode='w')
+            writer_summary_result = open(os.path.join(args.summary_result_path, 'summary_result.txt'), mode='a')
+        else:
+            dataset = read_dataset(args, args.dev_path, label_columns, vocab)
+            best_josn['dev_num'] = len(dataset)
+            random.shuffle(dataset)
+        input_ids = torch.LongTensor([example[0] for example in dataset])
+        label_ids = torch.LongTensor([example[1] for example in dataset])
+        length_ids = torch.LongTensor([example[2] for example in dataset])
+        input = [example[3] for example in dataset]
+
+        if is_test:
+            batch_size = 1
+        else:
+            batch_size = args.batch_size
+
+        for i, (input_ids_batch, label_ids_batch, length_ids_batch) in enumerate(
+                batch_loader(batch_size, input_ids, label_ids, length_ids)):
+            model.zero_grad()
+            input_ids_batch = input_ids_batch.cuda()
+            label_ids_batch = label_ids_batch.cuda()
+            length_ids_batch = length_ids_batch.cuda()
+
+            if args.attention_layer == 'att':
+                predicted, weight = model(input_ids_batch, length_ids_batch, elmo_embedding)
+            else:
+                predicted, weight,_ = model(input_ids_batch, length_ids_batch, elmo_embedding)
+            best_josn['Weights'] += weight.squeeze(dim=1).cpu().detach().numpy().tolist()
+            _, predicted_labels = torch.max(predicted.data, 1)
+            best_josn['Predict'] += predicted_labels.cpu().numpy().tolist()
+            best_josn['Label'] += label_ids_batch.data.cpu().numpy().tolist()
+
+        if is_test:
+            details_result = metrics.classification_report(best_josn['Label'], best_josn['Predict'])
+            best_josn['P_macro'], best_josn['R_macro'], best_josn['F_macro'], _ = metrics.precision_recall_fscore_support(best_josn['Label'], best_josn['Predict'], average="macro")
+            best_josn['ACC'] = metrics.classification.accuracy_score(best_josn['Label'], best_josn['Predict'])
+            saveSenResult(input, best_josn['Label'], best_josn['Predict'], args, best_josn['Weights'])
+            writer_result.writelines(details_result)
+            print("Testing Acc: {:.4f}, F_macro: {:.4f}, P_macro: {:.4f}, R_macro: {:.4f}".format(best_josn['ACC'],
+                                                                                                  best_josn['F_macro'],
+                                                                                                  best_josn['P_macro'],
+                                                                                                  best_josn['R_macro']))
+            writer_result.writelines(
+                "Testing Acc: {:.4f}, F_macro: {:.4f}, P_macro: {:.4f}, R_macro: {:.4f}".format(best_josn['ACC'],
+                                                                                                best_josn['F_macro'],
+                                                                                                best_josn['P_macro'],
+                                                                                                best_josn['R_macro']))
+            writer_summary_result.writelines('保存路径'+args.output_result_path+'\n')
+            writer_summary_result.writelines(
+                "Testing Acc: {:.4f}, F_macro: {:.4f}, P_macro: {:.4f}, R_macro: {:.4f}\n\n".format(best_josn['ACC'],
+                                                                                                best_josn['F_macro'],
+                                                                                                best_josn['P_macro'],
+                                                                                                best_josn['R_macro']))
+            writer_summary_result.writelines(details_result)
+        else:
+            best_josn['P_macro'], best_josn['R_macro'], best_josn['F_macro'], _ = metrics.precision_recall_fscore_support(best_josn['Label'], best_josn['Predict'],average="macro")
+            best_josn['ACC'] = metrics.classification.accuracy_score(best_josn['Label'], best_josn['Predict'])
+
+    def train():
+        print("Start training.")
+        mkdir(args.output_result_path)
+        writer_process = open(os.path.join(args.output_result_path, 'process.txt'), mode='w')
+        writer_process.writelines("Start training.")
+        trainset = read_dataset(args, args.train_path, label_columns, vocab)
+        random.shuffle(trainset)
+
+        best_josn['train_num'] = len(trainset)
+        input_ids = torch.LongTensor([example[0] for example in trainset])
+        label_ids = torch.LongTensor([example[1] for example in trainset])
+        length_ids = torch.LongTensor([example[2] for example in trainset])
+
+        print("Batch size: ", args.batch_size)
+        print("The number of training instances:", best_josn['train_num'])
+
+        start_time = time.time()
+        best_josn['Time'] = get_time_dif(start_time)
+        print("Time usage:", best_josn['Time'])
+
+        param_optimizer = list(model.named_parameters())
+        nll_criterion = nn.NLLLoss()
+        if args.attention_layer == 'm_pol_untrain_a':
+            optimizer_grouped_parameters = [{'params': [p for n, p in param_optimizer if ('query_embedding.weight' not in n)], 'weight_decay_rate': 0.01}]
+        else:
+            optimizer_grouped_parameters = [{'params': [p for n, p in param_optimizer], 'weight_decay_rate': 0.01}]
+        optimizer = optim.SGD(optimizer_grouped_parameters, lr = args.learning_rate, momentum = args.momentum)
+        for epoch in range(1, args.epochs_num + 1):
+            model.train()
+            for i, (input_ids_batch, label_ids_batch, length_ids_batch) in enumerate(
+                    batch_loader(args.batch_size, input_ids, label_ids,length_ids)):
+                model.zero_grad()
+                input_ids_batch = input_ids_batch.cuda()
+                label_ids_batch = label_ids_batch.cuda()
+                length_ids_batch = length_ids_batch.cuda()
+
+                if args.attention_layer == 'att':
+                    predicted_ids_batch,_ = model(input_ids_batch, length_ids_batch, elmo_embedding)
+                else:
+                    predicted_ids_batch, _, orthogonal_loss = model(input_ids_batch, length_ids_batch, elmo_embedding)
+                    best_josn['Total_orthogonal_loss'] += orthogonal_loss
+                batch_loss = nll_criterion(predicted_ids_batch, label_ids_batch)
+                best_josn['Total_batch_loss'] += batch_loss
+                if args.attention_layer != 'm_pre_orl_pun_a' and args.attention_layer != 'mpoa':
+                    optimizer.zero_grad()
+                    batch_loss.backward()
+                    optimizer.step()
+                else:
+                    optimizer.zero_grad()
+                    (0.1*orthogonal_loss).backward(retain_graph=True)
+                    (0.9*batch_loss).backward()
+                    optimizer.step()
+                best_josn['Time'] = get_time_dif(start_time)
+                if (i + 1) % args.report_steps == 0:
+                    if args.attention_layer == 'att':
+                        print("Epoch id: {}, Training steps: {}, Avg batch loss: {:.4f}, Time: {}".format(epoch, i + 1,
+                                                                                          best_josn['Total_batch_loss'] / args.report_steps, best_josn['Time']))
+                        writer_process.writelines("Epoch id: {}, Training steps: {}, Avg batch loss: {:.4f}, Time: {}".format(epoch, i + 1,
+                                                                                          best_josn['Total_batch_loss'] / args.report_steps, best_josn['Time']))
+                    else:
+                        print("Epoch id: {}, Training steps: {}, Avg batch loss: {:.4f}, Avg orthogonal loss: {:.4f}, Time: {}".format(epoch, i + 1,
+                                                                                          best_josn['Total_batch_loss'] / args.report_steps, best_josn['Total_orthogonal_loss'] / args.report_steps, best_josn['Time']))
+                        writer_process.writelines("Epoch id: {}, Training steps: {}, Avg batch loss: {:.4f}, Avg orthogonal loss: {:.4f}, Time: {}".format(epoch, i + 1,
+                                                                                          best_josn['Total_batch_loss'] / args.report_steps, best_josn['Total_orthogonal_loss'] / args.report_steps, best_josn['Time']))
+                    best_josn['Total_batch_loss'] = 0
+                    best_josn['Total_orthogonal_loss'] = 0
+            # 读取验证集
+            evaluate(args, False)
+            best_josn['Time'] = get_time_dif(start_time)
+            if best_josn['F_macro'] > best_josn['Best_F_macro'] + 0.001:
+                best_josn['Best_F_macro'] = best_josn['F_macro']
+                best_josn['Last_up_epoch'] = epoch
+                torch.save(model, os.path.join(args.output_result_path, 'result.pkl'))
+                print("Deving Acc: {:.4f}, F_macro: {:.4f}, Time: {} *".format(best_josn['ACC'], best_josn['F_macro'], best_josn['Time']))
+                writer_process.writelines("Deving Acc: {:.4f}, F_macro: {:.4f}, Time: {} *".format(best_josn['ACC'], best_josn['F_macro'], best_josn['Time']))
+            elif epoch - best_josn['Last_up_epoch'] == args.require_improvement:
+                print("No optimization for a long time, auto-stopping...")
+                writer_process.writelines("No optimization for a long time, auto-stopping...")
+                break
+            else:
+                print("Deving Acc: {:.4f}, F_macro: {:.4f}, Time: {} ".format(best_josn['ACC'], best_josn['F_macro'], best_josn['Time']))
+                writer_process.writelines("Deving Acc: {:.4f}, F_macro: {:.4f}, Time: {} ".format(best_josn['ACC'], best_josn['F_macro'], best_josn['Time']))
+
+    if args.run_type == 'train':
+        train()
     else:
-        net_p += [p]
-rnn_clf_optimizer_net = optim.SGD([{'params': net_p, 'weight_decay': 0}], lr=lr,momentum=momentum)
-rnn_clf_optimizer_att = optim.SGD([{'params': attention_p, 'weight_decay': 0}], lr=lr,momentum=momentum)
-'''
-3. 2
-train model
-'''
-# A counter for the number of gradient updates
-num_iter = 0
-best_micro = 0
-best_macro = 0
-last_micro = 0
-last_macro = 0
-for epoch in range(num_epochs):
-    print("Starting epoch {}".format(epoch + 1))
-    train_dataloader_vua = get_betch(raw_train_vua, word2idx, glove_embeddings, elmos_allennlp, elmos_hit,
-                                     embedding_sign, batch_size=batch_size, shuffle=True)
-    for (example_text, example_lengths, labels) in train_dataloader_vua:
-        example_text = Variable(example_text)
-        example_lengths = Variable(example_lengths)
-        labels = Variable(labels)
-        if using_GPU:
-            example_text = example_text.cuda()
-            example_lengths = example_lengths.cuda()
-            labels = labels.cuda()
-        predicted, attention_loss,_ = rnn_clf(example_text, example_lengths)
-        batch_loss = nll_criterion(predicted, labels)
-        num_iter += 1
+        model = torch.load(os.path.join(args.output_result_path, 'result.pkl'))
+        evaluate(args, True)
 
-        rnn_clf_optimizer_att.zero_grad()
-        attention_loss.backward()
-        rnn_clf_optimizer_att.step()
 
-        rnn_clf_optimizer_net.zero_grad()
-        batch_loss.backward()
-        rnn_clf_optimizer_net.step()
 
-        # Calculate validation and training set loss and accuracy every 200 gradient updates
-        if num_iter % print_per_batch == 0:
-            val_dataloader_vua = get_betch(raw_val_vua, word2idx, glove_embeddings, elmos_allennlp, elmos_hit,
-                                           embedding_sign, batch_size=1, shuffle=True)
-            avg_eval_loss,attention_loss, eval_accuracy, f_macro, f_micro = evaluate(val_dataloader_vua, rnn_clf,nll_criterion, using_GPU, 'train')
-            print("Iteration {}. Validation Predict Loss {}. Validation Attention Loss {}. Validation Accuracy {}. Validation f_macro {}. Validation f_micro {}.".format(
-                    num_iter, avg_eval_loss,attention_loss, eval_accuracy, f_macro, f_micro))
-            writer_process.write("Iteration {}. Validation Predict Loss {}. Validation Attention Loss {}. Validation Accuracy {}. Validation f_macro {}. Validation f_micro {}.\n".format(
-                    num_iter, avg_eval_loss,attention_loss, eval_accuracy, f_macro, f_micro))
-            if best_macro <= f_macro:
-                best_macro = f_macro
-                last_macro = num_iter
-                torch.save(rnn_clf, save_path+'model_macro.pkl')
-            if best_micro <= f_micro:
-                best_micro = f_micro
-                last_micro = num_iter
-                torch.save(rnn_clf, save_path+'model_micro.pkl')
-    if num_iter - last_macro > require_improvement and num_iter - last_micro > require_improvement:
-        print("No optimization for a long time, auto-stopping...")
-        writer_process.write("No optimization for a long time, auto-stopping...\n")
-        break
-print("Training done!")
-writer_process.write("Training done!\n")
-"""
-4. test the model
-"""
-#测试micro模型
-rnn_clf = torch.load(save_path+'model_micro.pkl')
-test_dataloader_vua = get_betch(raw_test_vua, word2idx, glove_embeddings, elmos_allennlp, elmos_hit, embedding_sign, batch_size=1, shuffle=False)
-avg_eval_loss, eval_accuracy, p_micro, r_micro, f_micro, y_test_cls, y_pred_cls, confusion_matrix,weights,details_result = evaluate(test_dataloader_vua, rnn_clf, nll_criterion, using_GPU, 'micro_test')
-print(details_result)
-writer_process.write(details_result)
-print("Micro: Test Accuracy {}. Test Precision {}. Test Recall {}. Test F_micro {}.".format(eval_accuracy, p_micro, r_micro, f_micro))
-writer_process.write("Micro: Test Accuracy {}. Test Precision {}. Test Recall {}. Test F_micro {}.\nConfusion_matrix:\n{}.\n".format(eval_accuracy, p_micro, r_micro, f_micro,str(confusion_matrix)))
-saveSenResult(raw_test_vua, y_test_cls, y_pred_cls, save_path,weights,'micro')
-#测试macro模型
-rnn_clf = torch.load(save_path+'model_macro.pkl')
-avg_eval_loss, eval_accuracy, p_macro, r_macro, f_macro, y_test_cls, y_pred_cls, confusion_matrix,weights,details_result = evaluate(test_dataloader_vua, rnn_clf,nll_criterion, using_GPU, 'macro_test')
-print(details_result)
-writer_process.write(details_result)
-print("Macro: Test Accuracy {}. Test Precision {}. Test Recall {}. Test F_macro {}.".format(eval_accuracy, p_macro, r_macro, f_macro))
-writer_process.write("Macro: Test Accuracy {}. Test Precision {}. Test Recall {}. Test F_micro {}.\nConfusion_matrix:\n{}.\n".format(eval_accuracy, p_macro, r_macro, f_macro,str(confusion_matrix)))
-saveSenResult(raw_test_vua, y_test_cls, y_pred_cls, save_path,weights,'macro')
+if __name__ == "__main__":
+    main()
