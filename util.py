@@ -1,22 +1,114 @@
-from tqdm import tqdm
-import torch
-import numpy as np
+import os
 import mmap
+import torch
+import time
 import json
-import csv
+import random
 import jieba
-from genhtml import GenHtml
-from torch.utils.data import Dataset
-from torch.utils.data import DataLoader
+from tqdm import tqdm
+import numpy as np
 import torch.nn as nn
-from sklearn import metrics
+from genhtml import GenHtml
+from datetime import timedelta
 from torch.autograd import Variable
-from sklearn.metrics import classification_report
-from allennlp.modules.elmo import Elmo, batch_to_ids
-from allennlp.commands.elmo import ElmoEmbedder
+from nltk.tokenize import WordPunctTokenizer
 
-# Misc helper functions
-# Get the number of lines from a filepath
+def set_seed(seed=7):
+    random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+def get_vocab(raw_dataset):
+    vocab = []
+    for example in raw_dataset:
+        vocab.extend(example[0].split())
+    vocab = set(vocab)
+    print("vocab size: ", len(vocab))
+    return vocab
+def read_cataloge(data_path):
+    labels_set = set()
+    label_columns = {}
+    with open(data_path, mode="r", encoding="utf-8") as f:
+        for line_id, line in enumerate(f):
+            try:
+                line = line.replace('\ufeff','').strip().split("\t")
+                if line_id == 0:  #####todo: title
+                    for i, column_name in enumerate(line):
+                        label_columns[column_name] = i
+                    continue
+                label = int(line[label_columns["label"]])
+                labels_set.add(label)
+            except:
+                pass
+    return label_columns
+
+def get_query_matrix(args):
+    if args.attention_layer == 'mpa' or args.attention_layer == 'mpoa' or args.attention_layer == 'm_pol_untrain_a':
+        with open(args.query_matrix_path, encoding='utf-8') as f:
+            emo_vector = json.load(f)
+        querys = torch.FloatTensor(args.num_classes, args.attention_query_size).cuda()
+        for i in range(args.num_classes):
+            querys[i] = torch.Tensor(emo_vector[str(i)]).cuda()
+    elif args.attention_layer == 'm_pre_orl_a' or args.attention_layer == 'm_pre_orl_pun_a':
+        querys = torch.empty(args.num_classes, args.attention_query_size)
+        nn.init.orthogonal_(querys)
+    elif args.attention_layer == 'm_a':
+        querys = torch.FloatTensor(args.num_classes, args.attention_query_size)
+    elif args.attention_layer == 'att':
+        querys = None
+    else:
+        print('error, attention layer type is error')
+    query_matrix = nn.Embedding(args.num_classes, args.attention_query_size)
+    query_matrix.weight = nn.Parameter(querys)
+    return query_matrix
+
+def mkdir(path):
+    folder = os.path.exists(path)
+    if not folder: #判断是否存在文件夹如果不存在则创建为文件夹
+       os.makedirs(path) #makedirs 创建文件时如果路径不存在会创建这个路径
+
+def read_dataset(args, path, columns, vocab):
+    dataset = []
+    with open(path, mode="r", encoding="utf-8") as f:
+        for line_id, line in enumerate(f):
+            if line_id == 0:
+                continue
+            try:
+                line = line.strip().split('\t')
+                if len(line) == 3:
+                    label = int(line[columns["label"]])
+                    text = line[columns["text"]]
+                    if args.language_type == 'zh':
+                        tokens = [vocab.get(t) for t in jieba.lcut(text)]
+                    else:
+                        tokens = [vocab.get(t) for t in WordPunctTokenizer().tokenize(text.lower())]
+                    if len(tokens) > args.seq_length:
+                        tokens = tokens[:args.seq_length]
+                    length = len(tokens)
+                    while len(tokens) < args.seq_length:
+                        tokens.append(0)
+                    dataset.append((tokens, label,length,text))
+                else:
+                    pass
+            except:
+                pass
+    return dataset
+
+def batch_loader(batch_size, input_ids, label_ids, length_ids):
+    instances_num = input_ids.size()[0]
+    for i in range(instances_num // batch_size):
+        input_ids_batch = input_ids[i*batch_size: (i+1)*batch_size, :]
+        label_ids_batch = label_ids[i*batch_size: (i+1)*batch_size]
+        length_ids_batch = length_ids[i*batch_size: (i+1)*batch_size]
+        yield input_ids_batch, label_ids_batch, length_ids_batch
+    if instances_num > instances_num // batch_size * batch_size:
+        input_ids_batch = input_ids[instances_num//batch_size*batch_size:, :]
+        label_ids_batch = label_ids[instances_num//batch_size*batch_size:]
+        length_ids_batch = length_ids[instances_num//batch_size*batch_size:]
+        yield input_ids_batch, label_ids_batch, length_ids_batch
+
 def get_num_lines(file_path):
     fp = open(file_path, "r+")
     buf = mmap.mmap(fp.fileno(), 0)
@@ -25,320 +117,140 @@ def get_num_lines(file_path):
         lines += 1
     return lines
 
-def get_betch(raw_vua, word2idx, random_embeddings, elmos_allennlp, elmos_hit, embedding_sign, batch_size=1, shuffle=False):
-    embedded_vua = [[embed_sequence(example[0], word2idx, random_embeddings, elmos_allennlp, elmos_hit, embedding_sign), example[2]]
-        for example in raw_vua]
-    dataset_vua = TextDatasetWithGloveElmoSuffix([example[0] for example in embedded_vua],
-                                 [example[1] for example in embedded_vua])
-    dataloader_vua = DataLoader(dataset=dataset_vua, batch_size=batch_size, shuffle=shuffle,
-                                      collate_fn=TextDatasetWithGloveElmoSuffix.collate_fn)
-    return dataloader_vua
-
-def get_data(path, id):
-    raw_vua = []
-    with open(path, encoding='ansi') as f:
-        lines = csv.reader(f)
-        for line in lines:
-            line[0] = id[jieba._lcut(line[0])[0]]
-            line[1] = jieba._lcut(line[1].replace(' ',''))
-            line[1] = " ".join(str(i) for i in line[1]).replace('\ue41d', '')
-            raw_vua.append([line[1], int(line[0]), int(line[2])])
-    return raw_vua
-
-def get_embedding_matrix(word2idx, idx2word, embedding_sign,embedding_input_type, normalization=False):
-    """
-    assume padding index is 0
-
-    :param word2idx: a dictionary: string --> int, includes <PAD> and <UNK>
-    :param idx2word: a dictionary: int --> string, includes <PAD> and <UNK>
-    :param normalization:
-    :return: an embedding matrix: a nn.Embeddings
-    """
-    # Load the GloVe vectors into a dictionary, keeping only words in vocab
-    embedding_dim = 200
-    glove_path = "F:\\WeiJiYao\\metaphor-in-context-master\\Tencent_AILab_ChineseEmbedding.txt"
-    glove_vectors = {}
-    with open(glove_path, encoding='utf-8') as glove_file:
-        for line in tqdm(glove_file, total=get_num_lines(glove_path)):
-            split_line = line.rstrip().split()
-            word = split_line[0]
-            if len(split_line) != (embedding_dim + 1) or word not in word2idx:
-                continue
-            assert (len(split_line) == embedding_dim + 1)
-            vector = np.array([float(x) for x in split_line[1:]], dtype="float32")
-            if normalization:
-                vector = vector / np.linalg.norm(vector)
-            assert len(vector) == embedding_dim
-            glove_vectors[word] = vector
-            if embedding_sign == None:
-                break
-    print("Number of pre-trained word vectors loaded: ", len(glove_vectors))
-    # Calculate mean and stdev of embeddings
-    all_embeddings = np.array(list(glove_vectors.values()))
-    embeddings_mean = float(np.mean(all_embeddings))
-    embeddings_stdev = float(np.std(all_embeddings))
-    print("Embeddings mean: ", embeddings_mean)
-    print("Embeddings stdev: ", embeddings_stdev)
-    # Randomly initialize an embedding matrix of (vocab_size, embedding_dim) shape
-    # with a similar distribution as the pretrained embeddings for words in vocab.
-    vocab_size = len(word2idx)
-    embedding_matrix = torch.FloatTensor(vocab_size, embedding_dim).normal_(embeddings_mean, embeddings_stdev)
-    # Go through the embedding matrix and replace the random vector with a
-    # pretrained one if available. Start iteration at 2 since 0, 1 are PAD, UNK
-    for i in range(2, vocab_size):
-        word = idx2word[i]
-        if word in glove_vectors:
-            embedding_matrix[i] = torch.FloatTensor(glove_vectors[word])
-    if normalization:
-        for i in range(vocab_size):
-            embedding_matrix[i] = embedding_matrix[i] / float(np.linalg.norm(embedding_matrix[i]))
-    embeddings = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
-    embeddings.weight = nn.Parameter(embedding_matrix)
-    return embeddings
-
-def get_vocab(raw_dataset):
-    """
-    return vocab set, and prints out the vocab size
-    :param raw_dataset: a list of lists: each inner list is a triple:
-                a sentence: string
-                a index: int: idx of the focus verb
-                a label: int 1 or 0
-    :return: a set: the vocabulary in the raw_dataset
-    """
-    vocab = []
-    for example in raw_dataset:
-        vocab.extend(example[0].split())
-    vocab = set(vocab)
-    print("vocab size: ", len(vocab))
-    return vocab
-
-def get_w2v_attention(data_path, w2v_type):
-    if w2v_type == 'emo_vector':
-        with open(data_path+'emo_vector.json', encoding='utf-8') as f:
-            emo_vector = json.load(f)
-    elif w2v_type == 'emo_vector_mean':
-        with open(data_path+'emo_vector_mean.json', encoding='utf-8') as f:
-            emo_vector = json.load(f)
-    w2v = torch.FloatTensor(3, 200)
-    w2v[0] = torch.Tensor(emo_vector['0'])
-    w2v[1] = torch.Tensor(emo_vector['1'])
-    w2v[2] = torch.Tensor(emo_vector['2'])
-    return w2v
-
-def get_word2idx_idx2word(vocab):
-    """
-    :param vocab: a set of strings: vocabulary
-    :return: word2idx: string to an int
-             idx2word: int to a string
-    """
-    word2idx = {"<PAD>": 0, "<UNK>": 1}
-    idx2word = {0: "<PAD>", 1: "<UNK>"}
-    for word in vocab:
-        assigned_index = len(word2idx)
-        word2idx[word] = assigned_index
-        idx2word[assigned_index] = word
-    return word2idx, idx2word
-
-
-def embed_sequence(sequence, word2idx, random_embeddings, elmo_allennlp, elmo_hit, elmo_sign):
-    words = sequence.split()
-    # 1. embed the sequence by glove vector
-    # Replace words with tokens, and 1 (UNK index) if words not indexed.
-    indexed_sequence = [word2idx.get(x, 1) for x in words]
-    # glove_part has shape: (seq_len, glove_dim)
-    glove_part = random_embeddings(Variable(torch.LongTensor(indexed_sequence)))
-    assert (glove_part.shape == (len(words), 200))
-    # 2. embed the sequence by elmo vectors
-    if elmo_sign == None or elmo_sign == 'tence':
-        return glove_part.data
-    elif elmo_sign == 'allennlp':
-        elmo_part = elmo_allennlp[json.loads(list(elmo_allennlp['sentence_to_index'])[0])[sequence]]
-    elif elmo_sign == 'hit':
-        elmo_part = elmo_hit.sents2elmo([sequence.split()])[0]
-    assert (elmo_part.shape == (len(words), 1024))
-    result = np.concatenate((glove_part.data, elmo_part), axis=1)
-    return result
-def saveSenResult(x_test, y_test_cls, y_pred_cls, save_path,weights,weight_type):
+def saveSenResult(x_test, y_test_cls, y_pred_cls, args, weights):
     """获得预测结果"""
-    writer_true = open(save_path + 'test_true.txt', mode='w')
-    writer_false = open(save_path + 'test_false.txt', mode='w')
+    writer_true = open(os.path.join(args.output_result_path,'true_test.txt'), mode='w')
+    writer_false = open(os.path.join(args.output_result_path,'false_test.txt'), mode='w')
     writer_true.write("预测\t真实\t句子\n")
     writer_false.write("预测\t真实\t句子\n")
     data_len = len(x_test)
     squ = []
     for i in range(data_len):
         if y_test_cls[i] == y_pred_cls[i]:
-            writer_true.write(str(y_pred_cls[i]) + "\t" + str(y_test_cls[i]) + "\t" + str(x_test[i][0]) + "\n")
+            writer_true.write(str(y_pred_cls[i]) + "\t" + str(y_test_cls[i]) + "\t" + str(x_test[i]) + "\n")
         else:
-            writer_false.write(str(y_pred_cls[i]) + "\t" + str(y_test_cls[i]) + "\t" + str(x_test[i][0]) + "\n")
-        squ.append(str(x_test[i][0]).split(' '))
-    dic = {'sequences': 0, 'attention_weights': 1, 'rea_labels': 2, 'pre_labels': 3}
+            writer_false.write(str(y_pred_cls[i]) + "\t" + str(y_test_cls[i]) + "\t" + str(x_test[i]) + "\n")
+        squ.append(str(x_test[i]).split(' '))
+    dic = {}
     dic['sequences'], dic['attention_weights'], dic['rea_labels'], dic[
         'pre_labels'] = squ, weights, y_test_cls, y_pred_cls
-    with open(save_path + weight_type+"_attn_data.json", 'w', encoding='utf-8') as fw:
+    with open(os.path.join(args.output_result_path,"attn_data.json"), 'w', encoding='utf-8') as fw:
         json.dump(dic, fw, ensure_ascii=False, indent=4)
     gh = GenHtml()
-    gh.gen(dic, weight_type,save_path)
-     
+    gh.gen(dic, args)
 
-def evaluate(evaluation_dataloader, model, criterion, using_GPU, type):
-    """
-    Evaluate the model on the given evaluation_dataloader
-    :param evaluation_dataloader:
-    :param model:
-    :param criterion: loss criterion
-    :param using_GPU: a boolean
-    :return:
-    """
-    # Set model to eval mode, which turns off dropout.
-    model.eval()
-    num_correct = 0
-    total_examples = 0
-    total_eval_loss = 0
-    predict, label, weights = [],[],[]
-    confusion_matrix = np.zeros((3, 3))
-    for (eval_text, eval_lengths, eval_labels) in evaluation_dataloader:
-        eval_text = Variable(eval_text)
-        eval_lengths = Variable(eval_lengths)
-        eval_labels = Variable(eval_labels)
-        if using_GPU:
-            eval_text = eval_text.cuda()
-            eval_lengths = eval_lengths.cuda()
-            eval_labels = eval_labels.cuda()
-        predicted, attention_loss,weight = model(eval_text, eval_lengths)
-        # Calculate loss for this test batch. This is averaged, so multiply
-        # by the number of examples in batch to get a total.
-        total_eval_loss += criterion(predicted, eval_labels).item() * eval_labels.size(0)
-        _, predicted_labels = torch.max(predicted.data, 1)
-        total_examples += eval_labels.size(0)
-        num_correct += torch.sum(predicted_labels == eval_labels.data)
-        predict += predicted_labels.cpu().numpy().tolist()
-        label += eval_labels.data.cpu().numpy().tolist()
-        weights += weight.squeeze(dim=1).cpu().detach().numpy().tolist()
-        for i in range(eval_labels.size(0)):
-            confusion_matrix[eval_labels.data[i], int(predicted_labels[i])] += 1
-    accuracy = 100 * num_correct / total_examples
-    average_eval_loss = total_eval_loss / total_examples
-    precision = [0, 0, 0]
-    recall = [0, 0, 0]
-    recall_sum = 0
-    precision_sum = 0
-    for num in range(3):
-        if np.sum(confusion_matrix[num]) != 0:
-            precision[num] = 100 * confusion_matrix[num, num] / np.sum(confusion_matrix[num])
+def get_embedding_matrix(args, vocab, normalization=False):
+    glove_path = args.pretrained_w2v_model_path
+    glove_vectors = {}
+    if args.pretrain_model_type == 'w2v':
+        with open(glove_path, encoding='gbk') as glove_file:
+            for line in tqdm(glove_file, total=get_num_lines(glove_path)):
+                split_line = line.rstrip().split()
+                word = split_line[0]
+                if len(split_line) != (args.w2v_embedding_dim + 1) or word not in vocab.w2i:
+                    continue
+                assert (len(split_line) == args.w2v_embedding_dim + 1)
+                vector = np.array([float(x) for x in split_line[1:]], dtype="float32")
+                if normalization:
+                    vector = vector / np.linalg.norm(vector)
+                assert len(vector) == args.w2v_embedding_dim
+                glove_vectors[word] = vector
+        print("Number of pre-trained word vectors loaded: ", len(glove_vectors))
+        all_embeddings = np.array(list(glove_vectors.values()))
+        embeddings_mean = float(np.mean(all_embeddings))
+        embeddings_stdev = float(np.std(all_embeddings))
+        print("Embeddings mean: ", embeddings_mean)
+        print("Embeddings stdev: ", embeddings_stdev)
+        embedding_matrix = torch.FloatTensor(vocab.size, args.w2v_embedding_dim).normal_(embeddings_mean, embeddings_stdev)
+        for i in range(2, vocab.size):
+            word = vocab.i2w[i]
+            if word in glove_vectors:
+                embedding_matrix[i] = torch.FloatTensor(glove_vectors[word])
+        if normalization:
+            for i in range(vocab.size):
+                embedding_matrix[i] = embedding_matrix[i] / float(np.linalg.norm(embedding_matrix[i]))
+        embeddings = nn.Embedding(vocab.size, args.w2v_embedding_dim, padding_idx=0)
+        embeddings.weight = nn.Parameter(embedding_matrix)
+    else:
+        embeddings = nn.Embedding(vocab.size, args.w2v_embedding_dim, padding_idx=0)
+    return embeddings
+
+class Vocab(object):
+    def __init__(self):
+        self.w2i = {}
+        self.i2w = []
+        self.w2c = {}
+        self.size = 0
+    def load(self, vocab_path, is_quiet=False):
+        with open(vocab_path, mode="r", encoding="utf-8") as reader:
+            for index, line in enumerate(reader):
+                try:
+                    w = line.strip().split()[0]
+                    if w in self.w2i:
+                        print(w)
+                    self.w2i[w] = index
+                    self.i2w.append(w)
+                except:
+                    print(w)
+                    self.w2i["???" + str(index)] = index
+                    self.i2w.append("???" + str(index))
+                    if not is_quiet:
+                        print("Vocabulary file line " + str(index + 1) + " has bad format token")
+            assert len(self.w2i) == len(self.i2w)
+        if not is_quiet:
+            self.size = len(self.w2i)
+            print("Vocabulary Size: ", self.size)
+    def get(self, w):
+        return self.w2i.get(w)
+
+def get_time_dif(start_time):
+    """获取已使用时间"""
+    end_time = time.time()
+    time_dif = end_time - start_time
+    return timedelta(seconds=int(round(time_dif)))
+
+def using_GPU_num(gpu_num):
+    os.environ['CUDA_VISIBLE_DEVICES'] = gpu_num
+
+def saveSenResult(x_test, y_test_cls, y_pred_cls, args, weights):
+    """获得预测结果"""
+    writer_true = open(os.path.join(args.output_result_path,'true_test.txt'), encoding='utf-8', mode='w')
+    writer_false = open(os.path.join(args.output_result_path,'false_test.txt'),encoding='utf-8', mode='w')
+    writer_true.write("预测\t真实\t句子\n")
+    writer_false.write("预测\t真实\t句子\n")
+    data_len = len(x_test)
+    squ = []
+    for i in range(data_len):
+        if y_test_cls[i] == y_pred_cls[i]:
+            writer_true.write(str(y_pred_cls[i]) + "\t" + str(y_test_cls[i]) + "\t" + str(x_test[i]) + "\n")
         else:
-            precision[num] = 0
-        if np.sum(confusion_matrix[:,num]) != 0:
-            recall[num] = 100 * confusion_matrix[num, num] / np.sum(confusion_matrix[:,num])
-        else:
-            recall[num] = 0
-        recall_sum += recall[num]
-        precision_sum += precision[num]
-    recall = recall_sum / 3
-    precision = precision_sum / 3
-    model.train()
-    # Set the model back to train mode, which activates dropout again.
-    print(confusion_matrix)
-    if type == 'train':
-        P_macro, R_macro, F_macro, _ = metrics.precision_recall_fscore_support(label, predict, average="macro")
-        P_micro, R_micro, F_micro, _ = metrics.precision_recall_fscore_support(label, predict, average="micro")
-        print('Classfy P-micro: {0:>7.2} , Classfy R-micro: {1:>7.2} , Classfy F-micro: {2:>7.2}'.format(P_micro, R_micro,F_micro))
-        print('Classfy P-macro: {0:>7.2} , Classfy R-macro: {1:>7.2} , Classfy F-macro: {2:>7.2}'.format(P_macro, R_macro,F_macro))
-        return average_eval_loss,attention_loss[0][0], accuracy, F_macro, F_micro
-    elif type == 'micro_test':
-        details_result = classification_report(label, predict)
-        P_micro, R_micro, F_micro, _ = metrics.precision_recall_fscore_support(label, predict, average="micro")
-        return average_eval_loss, accuracy, P_micro, R_micro, F_micro, label, predict, confusion_matrix,weights,details_result
-    elif type == 'macro_test':
-        details_result = classification_report(label, predict)
-        P_macro, R_macro, F_macro, _ = metrics.precision_recall_fscore_support(label, predict, average="macro")
-        return average_eval_loss, accuracy, P_macro, R_macro, F_macro, label, predict, confusion_matrix,weights,details_result
+            writer_false.write(str(y_pred_cls[i]) + "\t" + str(y_test_cls[i]) + "\t" + str(x_test[i]) + "\n")
+        squ.append(str(x_test[i]).split(' '))
+    if args.attention_layer == 'none':
+        return
+    dic = {}
+    dic['sequences'], dic['attention_weights'], dic['rea_labels'], dic[
+        'pre_labels'] = squ, weights, y_test_cls, y_pred_cls
+    with open(os.path.join(args.output_result_path,"attn_data.json"), 'w', encoding='utf-8') as fw:
+        json.dump(dic, fw, ensure_ascii=False, indent=4)
+    gh = GenHtml()
+    gh.gen(dic, os.path.join(args.output_result_path,'attention.html'), args)
 
-# Make sure to subclass torch.utils.data.Dataset
-class TextDatasetWithGloveElmoSuffix(Dataset):
-    def __init__(self, embedded_text, labels, max_sequence_length=550):
-        """
-        :param embedded_text:
-        :param labels: a list of ints
-        :param max_sequence_length: an int
-        """
-        if len(embedded_text) != len(labels):
-            raise ValueError("Differing number of sentences and labels!")
-        # A list of numpy arrays, where each inner numpy arrays is sequence_length * embed_dim
-        # embedding for each word is : glove + elmo
-        self.embedded_text = embedded_text
-        # A list of ints, where each int is a label of the sentence at the corresponding index.
-        self.labels = labels
-        # Truncate examples that are longer than max_sequence_length.
-        # Long sequences are expensive and might blow up GPU memory usage.
-        self.max_sequence_length = max_sequence_length
+def sort_batch_by_length(tensor: torch.Tensor, sequence_lengths: torch.Tensor):
+    if not isinstance(tensor, torch.Tensor) or not isinstance(sequence_lengths, torch.Tensor):
+        raise ConfigurationError("Both the tensor and sequence lengths must be torch.Tensors.")
 
+    sorted_sequence_lengths, permutation_index = sequence_lengths.sort(0, descending=True)
+    sorted_tensor = tensor.index_select(0, permutation_index)
 
-    def __getitem__(self, idx):
-        """
-        Return the Dataset example at index `idx`.
-        Returns
-        -------
-        example_text: numpy array
-        length: int
-            The length of the (possibly truncated) example_text.
-        example_label: int 0 or 1
-            The label of the example.
-        """
-        example_text = self.embedded_text[idx]
-        example_label = self.labels[idx]
-        # Truncate the sequence if necessary
-        example_text = example_text[:self.max_sequence_length]
-        example_length = example_text.shape[0]
-        return example_text, example_length, example_label
-
-    def __len__(self):
-        """
-        Return the number of examples in the Dataset.
-        """
-        return len(self.labels)
-
-    @staticmethod
-    def collate_fn(batch):
-        """
-        Given a list of examples (each from __getitem__),
-        combine them to form a single batch by padding.
-        Returns:
-        -------
-        batch_padded_example_text: LongTensor
-          LongTensor of shape (batch_size, longest_sequence_length) with the
-          padded text for each example in the batch.
-        length: LongTensor
-          LongTensor of shape (batch_size,) with the unpadded length of the example.
-        example_label: LongTensor
-          LongTensor of shape (batch_size,) with the label of the example.
-        """
-        batch_padded_example_text = []
-        batch_lengths = []
-        batch_labels = []
-        # Get the length of the longest sequence in the batch
-        max_length = max(batch, key=lambda example: example[1])[1]
-        # Iterate over each example in the batch
-        for text, length, label in batch:
-            # Unpack the example (returned from __getitem__)
-            # Amount to pad is length of longest example - length of this example.
-            amount_to_pad = max_length - length
-            # Tensor of shape (amount_to_pad,), converted to LongTensor
-            pad_tensor = torch.zeros(amount_to_pad, text.shape[1])
-            # Append the pad_tensor to the example_text tensor.
-            # Shape of padded_example_text: (padded_length, embeding_dim)
-            # top part is the original text numpy,
-            # and the bottom part is the 0 padded tensors
-            # text from the batch is a np array, but cat requires the argument to be the same type
-            # turn the text into a torch.FloatTenser, which is the same type as pad_tensor
-            text = torch.Tensor(text)
-            padded_example_text = torch.cat((text, pad_tensor), dim=0)
-            # Add the padded example to our batch
-            batch_padded_example_text.append(padded_example_text)
-            batch_lengths.append(length)
-            batch_labels.append(label)
-        # Stack the list of LongTensors into a single LongTensor
-        return (torch.stack(batch_padded_example_text),
-                torch.LongTensor(batch_lengths),
-                torch.LongTensor(batch_labels))
-                
+    index_range = torch.arange(0, len(sequence_lengths), device=sequence_lengths.device)
+    # This is the equivalent of zipping with index, sorting by the original
+    # sequence lengths and returning the now sorted indices.
+    _, reverse_mapping = permutation_index.sort(0, descending=False)
+    restoration_indices = index_range.index_select(0, reverse_mapping)
+    return sorted_tensor, sorted_sequence_lengths, restoration_indices, permutation_index
+def last_dim_softmax(vector, mask):
+    result = torch.nn.functional.softmax(vector*mask, dim = -1)
+    result = result * mask
+    result = result / (result.sum(dim = 1, keepdim = True) + 1e-13)
+    return result
